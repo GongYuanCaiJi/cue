@@ -95,6 +95,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 writeResponse(["success": false, "error": error.localizedDescription])
             }
 
+        case "statusframe":
+            if let f = statusBarController?.buttonScreenFrame() {
+                writeResponse(["success": true,
+                               "x": Double(f.origin.x), "y": Double(f.origin.y),
+                               "w": Double(f.width), "h": Double(f.height)])
+            } else {
+                writeResponse(["success": false, "error": "no status button"])
+            }
+
+        case "listwindows":
+            // 測試/除錯用:把可 pin 的視窗清單 dump 成 JSON(跟選單同一份來源)
+            let ws = await enumeratePinnableWindows()
+            let arr: [[String: Any]] = ws.map { [
+                "app": $0.appName,
+                "title": $0.windowTitle ?? "",
+                "id": Int($0.windowID),
+                "w": Int($0.bounds.width),
+                "h": Int($0.bounds.height)
+            ] }
+            writeResponse(["success": true, "count": ws.count, "windows": arr])
+
         case "pin-window":
             guard let windowIDStr = params["id"],
                   let windowID = UInt32(windowIDStr) else {
@@ -161,8 +182,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             throw AgentError.captureFailure("agent_not_ready")
         }
 
-        let detector = TargetWindowDetector()
-        let windows = detector.getAllWindows()
+        // 用跟選單同一份穩定清單(SCShareableContent,含被遮住/跨 Space),不再用 onScreen-only 的 CGWindowList 重查
+        let windows = await enumeratePinnableWindows()
 
         guard let target = windows.first(where: { $0.windowID == windowID }) else {
             throw AgentError.noTargetWindow

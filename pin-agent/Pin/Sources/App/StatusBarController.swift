@@ -43,6 +43,13 @@ final class StatusBarController {
         updateMenu()
     }
 
+    /// 狀態列按鈕在螢幕上的位置(Cocoa 座標,左下原點),給自動化測試定位用
+    func buttonScreenFrame() -> CGRect? {
+        guard let button = statusItem?.button, let win = button.window else { return nil }
+        let inWindow = button.convert(button.bounds, to: nil)
+        return win.convertToScreen(inWindow)
+    }
+
     private func updateMenu() {
         let menu = NSMenu()
 
@@ -186,59 +193,18 @@ final class StatusBarController {
     // MARK: - Helpers
 
     private func getAvailableWindows() -> [TargetWindowInfo]? {
-        guard let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
-            return nil
+        // 用 SCShareableContent 當權威來源(跨 Space、含遮住的、不去重)。
+        // 它是 async,選單同步建,所以在背景執行緒跑再用 semaphore 等結果(不會卡死主執行緒:
+        // SCShareableContent 在自己的 executor 執行,不回主執行緒)。
+        let sem = DispatchSemaphore(value: 0)
+        var result: [TargetWindowInfo] = []
+        Task.detached {
+            result = await enumeratePinnableWindows()
+            sem.signal()
         }
-
-        var windows: [TargetWindowInfo] = []
-        var seenPIDs: Set<pid_t> = []
-
-        for windowInfo in windowList {
-            guard let pid = windowInfo[kCGWindowOwnerPID as String] as? pid_t,
-                  let windowID = windowInfo[kCGWindowNumber as String] as? CGWindowID,
-                  let ownerName = windowInfo[kCGWindowOwnerName as String] as? String,
-                  let boundsDict = windowInfo[kCGWindowBounds as String] as? [String: CGFloat] else {
-                continue
-            }
-
-            // Skip our own app
-            if pid == ProcessInfo.processInfo.processIdentifier {
-                continue
-            }
-
-            // Skip windows without reasonable size
-            let width = boundsDict["Width"] ?? 0
-            let height = boundsDict["Height"] ?? 0
-            guard width > 100 && height > 100 else {
-                continue
-            }
-
-            // Skip if we already have a window from this app (take the first one)
-            if seenPIDs.contains(pid) {
-                continue
-            }
-            seenPIDs.insert(pid)
-
-            let bounds = CGRect(
-                x: boundsDict["X"] ?? 0,
-                y: boundsDict["Y"] ?? 0,
-                width: width,
-                height: height
-            )
-
-            let windowTitle = windowInfo[kCGWindowName as String] as? String
-
-            let info = TargetWindowInfo(
-                pid: pid,
-                windowID: windowID,
-                appName: ownerName,
-                windowTitle: windowTitle,
-                bounds: bounds
-            )
-            windows.append(info)
-        }
-
-        return windows
+        // 最多等 3 秒,避免萬一卡住讓選單永久打不開
+        _ = sem.wait(timeout: .now() + 3)
+        return result
     }
 
     private static func isScreenRecordingPermissionError(_ error: Error) -> Bool {

@@ -62,14 +62,26 @@ final class MirrorWindowController: NSObject {
         }
         window?.ignoresMouseEvents = false
         window?.alphaValue = 1
-        window?.orderFront(nil)
+
+        // 念稿模式:固定成主螢幕中央的合理大小(不依來源比例,避免變成一條),之後可自由移動/縮放
+        if let window = window {
+            let screen = NSScreen.main ?? NSScreen.screens.first!
+            let vis = screen.visibleFrame
+            let w = min(vis.width * 0.45, 820)
+            let h = min(vis.height * 0.6, 620)
+            let x = vis.midX - w / 2
+            let y = vis.midY - h / 2
+            window.setFrame(NSRect(x: x, y: y, width: w, height: h), display: true)
+        }
+        window?.makeKeyAndOrderFront(nil)
         window?.hasShadow = true
+        NSApp.activate(ignoringOtherApps: true)
 
         // Show pin button window
         pinButtonWindow?.orderFront(nil)
 
-        // Start geometry synchronization
-        startGeometrySync()
+        // 不啟動 geometry sync:念稿浮窗要能自由移動/縮放,不被拉回來源視窗位置
+        // startGeometrySync()
     }
 
     /// Hide the mirror window (for hover model)
@@ -251,7 +263,7 @@ final class MirrorWindowController: NSObject {
         // Convert CGRect bounds (screen coordinates) to NSRect
         let frame = convertToScreenFrame(targetInfo.bounds)
 
-        // Create borderless, floating window
+        // 念稿浮窗:先用 borderless(確保擷取畫面 render),縮放另外手動實作
         let window = NSWindow(
             contentRect: frame,
             styleMask: .borderless,
@@ -264,7 +276,14 @@ final class MirrorWindowController: NSObject {
         window.backgroundColor = .clear
         window.hasShadow = true
         window.ignoresMouseEvents = false
-        window.collectionBehavior = [.canJoinAllSpaces, .stationary]
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        window.isMovableByWindowBackground = false  // 移動/縮放都在 hoverView.mouseDown 手動處理
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.title = "念稿"
+        window.standardWindowButton(.closeButton)?.isHidden = true
+        window.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        window.standardWindowButton(.zoomButton)?.isHidden = true
 
         // Make content view layer-backed for transparency
         // Note: No cornerRadius - ScreenCaptureKit captures window with its original transparency
@@ -284,6 +303,9 @@ final class MirrorWindowController: NSObject {
         }
         hoverView.onClick = { [weak self] in
             self?.handleClick()
+        }
+        hoverView.onResize = { [weak self] in
+            self?.updateVideoLayerFrame()
         }
         window.contentView?.addSubview(hoverView)
 
@@ -449,8 +471,10 @@ private class HoverHandlerView: NSView {
 
     var onHover: ((Bool) -> Void)?
     var onClick: (() -> Void)?
+    var onResize: (() -> Void)?
 
     private var trackingArea: NSTrackingArea?
+    private let edgeMargin: CGFloat = 16
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -511,8 +535,50 @@ private class HoverHandlerView: NSView {
         onHover?(false)
     }
 
+    // 全部自己處理:邊緣拖=縮放,中間拖=移動
+    override var mouseDownCanMoveWindow: Bool { false }
+
     override func mouseDown(with event: NSEvent) {
-        onClick?()
+        guard let window = window else { return }
+        let p = convert(event.locationInWindow, from: nil)  // view 座標(左下原點)
+        let m = edgeMargin
+        let left = p.x <= m
+        let right = p.x >= bounds.width - m
+        let bottom = p.y <= m
+        let top = p.y >= bounds.height - m
+        let resizing = left || right || top || bottom
+
+        let startFrame = window.frame          // 螢幕座標(左下原點)
+        let startMouse = NSEvent.mouseLocation  // 螢幕座標
+        let minW: CGFloat = 220, minH: CGFloat = 160
+
+        while let ev = NSApp.nextEvent(matching: [.leftMouseDragged, .leftMouseUp],
+                                       until: .distantFuture, inMode: .eventTracking, dequeue: true) {
+            if ev.type == .leftMouseUp { break }
+            let cur = NSEvent.mouseLocation
+            let dx = cur.x - startMouse.x
+            let dy = cur.y - startMouse.y
+            var f = startFrame
+            if !resizing {
+                f.origin.x = startFrame.origin.x + dx
+                f.origin.y = startFrame.origin.y + dy
+            } else {
+                if right { f.size.width = max(minW, startFrame.width + dx) }
+                if left {
+                    let nw = max(minW, startFrame.width - dx)
+                    f.origin.x = startFrame.maxX - nw
+                    f.size.width = nw
+                }
+                if top { f.size.height = max(minH, startFrame.height + dy) }
+                if bottom {
+                    let nh = max(minH, startFrame.height - dy)
+                    f.origin.y = startFrame.maxY - nh
+                    f.size.height = nh
+                }
+            }
+            window.setFrame(f, display: true)
+            onResize?()
+        }
     }
 }
 

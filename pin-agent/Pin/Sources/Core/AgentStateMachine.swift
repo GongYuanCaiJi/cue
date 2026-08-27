@@ -86,7 +86,8 @@ final class AgentStateMachine {
         pinnedSince = Date()
 
         // Get SCShareableContent to find SCWindow and SCDisplay
-        let content = try await SCShareableContent.current
+        // onScreenWindowsOnly: false → 連被遮住/在別的 Space 的視窗都找得到,跟清單一致
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
         guard let scWindow = content.windows.first(where: { $0.windowID == target.windowID }) else {
             throw AgentError.captureFailure("Target window not found in shareable content")
         }
