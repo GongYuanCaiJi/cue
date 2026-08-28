@@ -11,7 +11,14 @@ final class MirrorWindowController: NSObject {
 
     private var window: NSWindow?
     private var hoverView: HoverHandlerView?
+    private var resizeGrip: ResizeGripView?
     private let targetInfo: TargetWindowInfo
+
+    /// 來源視窗的長寬比(width/height),用來鎖定浮窗比例,縮放不變形
+    private var sourceAspect: CGFloat {
+        let w = targetInfo.bounds.width, h = targetInfo.bounds.height
+        return (w > 0 && h > 0) ? w / h : 4.0 / 3.0
+    }
 
     private var geometryObserver: GeometryObserver?
 
@@ -63,15 +70,18 @@ final class MirrorWindowController: NSObject {
         window?.ignoresMouseEvents = false
         window?.alphaValue = 1
 
-        // 念稿模式:固定成主螢幕中央的合理大小(不依來源比例,避免變成一條),之後可自由移動/縮放
+        // 念稿模式:置中,尺寸鎖定來源比例(100% 忠實投影,縮放不變形不裁切)
         if let window = window {
             let screen = NSScreen.main ?? NSScreen.screens.first!
             let vis = screen.visibleFrame
-            let w = min(vis.width * 0.45, 820)
-            let h = min(vis.height * 0.6, 620)
+            let aspect = sourceAspect
+            var h = min(vis.height * 0.7, 780)
+            var w = h * aspect
+            if w > vis.width * 0.55 { w = vis.width * 0.55; h = w / aspect }
             let x = vis.midX - w / 2
             let y = vis.midY - h / 2
             window.setFrame(NSRect(x: x, y: y, width: w, height: h), display: true)
+            window.aspectRatio = NSSize(width: aspect, height: 1)  // 系統層面也鎖比例
         }
         window?.makeKeyAndOrderFront(nil)
         window?.hasShadow = true
@@ -141,8 +151,9 @@ final class MirrorWindowController: NSObject {
         // 4. Remove video layer from hierarchy before any window operations
         captureManager.videoLayer.removeFromSuperlayer()
 
-        // 5. Remove hover view and pin button from superview explicitly
+        // 5. Remove hover view, resize grip and pin button from superview explicitly
         hoverView?.removeFromSuperview()
+        resizeGrip?.removeFromSuperview()
         pinButton?.removeFromSuperview()
 
         // 6. Hide the windows immediately (orderOut, not close)
@@ -154,6 +165,7 @@ final class MirrorWindowController: NSObject {
         // when all references (including animation blocks) are gone
         window = nil
         hoverView = nil
+        resizeGrip = nil
         pinButton = nil
         pinButtonWindow = nil
     }
@@ -168,8 +180,8 @@ final class MirrorWindowController: NSObject {
         videoLayer.frame = contentView.bounds
         videoLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
 
-        // Critical: Set videoGravity to resize content to fill the layer
-        videoLayer.videoGravity = .resizeAspectFill
+        // 完整顯示來源、不裁切(配合視窗鎖定來源比例,不會有黑邊也不變形)
+        videoLayer.videoGravity = .resizeAspect
 
         // Set contentsScale based on the window's backing scale factor
         if let screen = window?.screen {
@@ -223,6 +235,7 @@ final class MirrorWindowController: NSObject {
         // Notify state machine to hide mirror
         onHoverChanged?(true)
     }
+
 
     // MARK: - Global Mouse Monitoring
 
@@ -309,8 +322,19 @@ final class MirrorWindowController: NSObject {
         }
         window.contentView?.addSubview(hoverView)
 
+        // 右下角可見的縮放把手(等比例縮放,拖它才縮放;拖其他地方=移動)
+        let gripSize: CGFloat = 26
+        let cv = window.contentView!
+        let grip = ResizeGripView(frame: NSRect(x: cv.bounds.width - gripSize, y: 0,
+                                                width: gripSize, height: gripSize))
+        grip.autoresizingMask = [.minXMargin, .maxYMargin]  // 固定黏在右下角
+        grip.aspect = sourceAspect
+        grip.onResize = { [weak self] in self?.updateVideoLayerFrame() }
+        cv.addSubview(grip)
+
         self.window = window
         self.hoverView = hoverView
+        self.resizeGrip = grip
 
         // Create separate pin button window (always clickable)
         createPinButtonWindow(relativeTo: frame)
@@ -474,7 +498,6 @@ private class HoverHandlerView: NSView {
     var onResize: (() -> Void)?
 
     private var trackingArea: NSTrackingArea?
-    private let edgeMargin: CGFloat = 16
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -535,47 +558,71 @@ private class HoverHandlerView: NSView {
         onHover?(false)
     }
 
-    // 全部自己處理:邊緣拖=縮放,中間拖=移動
+    // 拖任何地方 = 移動整個浮窗(縮放交給右下角的把手)
     override var mouseDownCanMoveWindow: Bool { false }
 
     override func mouseDown(with event: NSEvent) {
         guard let window = window else { return }
-        let p = convert(event.locationInWindow, from: nil)  // view 座標(左下原點)
-        let m = edgeMargin
-        let left = p.x <= m
-        let right = p.x >= bounds.width - m
-        let bottom = p.y <= m
-        let top = p.y >= bounds.height - m
-        let resizing = left || right || top || bottom
-
-        let startFrame = window.frame          // 螢幕座標(左下原點)
-        let startMouse = NSEvent.mouseLocation  // 螢幕座標
-        let minW: CGFloat = 220, minH: CGFloat = 160
-
+        let startFrame = window.frame
+        let startMouse = NSEvent.mouseLocation
         while let ev = NSApp.nextEvent(matching: [.leftMouseDragged, .leftMouseUp],
                                        until: .distantFuture, inMode: .eventTracking, dequeue: true) {
             if ev.type == .leftMouseUp { break }
             let cur = NSEvent.mouseLocation
-            let dx = cur.x - startMouse.x
-            let dy = cur.y - startMouse.y
             var f = startFrame
-            if !resizing {
-                f.origin.x = startFrame.origin.x + dx
-                f.origin.y = startFrame.origin.y + dy
-            } else {
-                if right { f.size.width = max(minW, startFrame.width + dx) }
-                if left {
-                    let nw = max(minW, startFrame.width - dx)
-                    f.origin.x = startFrame.maxX - nw
-                    f.size.width = nw
-                }
-                if top { f.size.height = max(minH, startFrame.height + dy) }
-                if bottom {
-                    let nh = max(minH, startFrame.height - dy)
-                    f.origin.y = startFrame.maxY - nh
-                    f.size.height = nh
-                }
-            }
+            f.origin.x = startFrame.origin.x + (cur.x - startMouse.x)
+            f.origin.y = startFrame.origin.y + (cur.y - startMouse.y)
+            window.setFrame(f, display: true)
+        }
+    }
+}
+
+// MARK: - Resize Grip View
+
+/// 右下角可見的縮放把手。只有拖它才會縮放,而且鎖定來源比例(等比例,不變形不裁切)。
+private class ResizeGripView: NSView {
+    var aspect: CGFloat = 0          // width/height;0 = 不縮放
+    var onResize: (() -> Void)?
+
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    override func draw(_ dirtyRect: NSRect) {
+        // 半透明深色底,讓把手在淺色/深色內容上都看得見
+        NSColor(white: 0, alpha: 0.28).setFill()
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 5, yRadius: 5).fill()
+        // 右下角三條白色斜線
+        NSColor(white: 1, alpha: 0.75).setStroke()
+        let path = NSBezierPath()
+        path.lineWidth = 1.5
+        for off in [CGFloat(5), 10, 15] {
+            path.move(to: NSPoint(x: bounds.maxX - off, y: 4))
+            path.line(to: NSPoint(x: bounds.maxX - 4, y: off))
+        }
+        path.stroke()
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: NSCursor.crosshair)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let window = window, aspect > 0 else { return }
+        let startFrame = window.frame
+        let startMouse = NSEvent.mouseLocation
+        let topEdge = startFrame.maxY       // 頂邊固定
+        let leftEdge = startFrame.origin.x  // 左邊固定
+        let minW: CGFloat = 260
+        while let ev = NSApp.nextEvent(matching: [.leftMouseDragged, .leftMouseUp],
+                                       until: .distantFuture, inMode: .eventTracking, dequeue: true) {
+            if ev.type == .leftMouseUp { break }
+            let cur = NSEvent.mouseLocation
+            let w = max(minW, startFrame.width + (cur.x - startMouse.x))
+            let h = w / aspect
+            var f = startFrame
+            f.origin.x = leftEdge
+            f.size.width = w
+            f.size.height = h
+            f.origin.y = topEdge - h  // 頂邊固定,往右下長
             window.setFrame(f, display: true)
             onResize?()
         }
